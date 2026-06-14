@@ -5,6 +5,27 @@ $port   = 8080
 $root   = $PSScriptRoot
 $prefix = "http://localhost:$port/"
 
+# Groq exige TLS 1.2 — o Windows PowerShell 5.1 nao usa por padrao.
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+$groqEndpoint = 'https://api.groq.com/openai/v1/chat/completions'
+
+# Carrega o .env (se existir) para o ambiente. Variaveis ja definidas no
+# ambiente tem precedencia.
+$envFile = Join-Path $root '.env'
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line.Contains('=')) {
+            $idx = $line.IndexOf('=')
+            $k = $line.Substring(0, $idx).Trim()
+            $v = $line.Substring($idx + 1).Trim().Trim('"').Trim("'")
+            if (-not [Environment]::GetEnvironmentVariable($k)) {
+                Set-Item -Path "env:$k" -Value $v
+            }
+        }
+    }
+}
+
 $mime = @{
     '.html' = 'text/html; charset=utf-8'
     '.css'  = 'text/css; charset=utf-8'
@@ -39,6 +60,67 @@ try {
 
         $urlPath = $req.Url.AbsolutePath
         if ($urlPath -eq '/') { $urlPath = '/index.html' }
+
+        # ── Proxy para a API do Groq ─────────────────────────────────
+        # O navegador envia o corpo (payload) do /chat/completions; aqui
+        # apenas injetamos o cabecalho Authorization com $env:API_KEY e
+        # encaminhamos. A chave nunca chega ao cliente.
+        if ($req.HttpMethod -eq 'POST' -and $urlPath -eq '/api/groq') {
+            $reader = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+            $body   = $reader.ReadToEnd()
+            $reader.Close()
+
+            $key = $env:API_KEY
+            if ([string]::IsNullOrWhiteSpace($key)) {
+                $msg  = '{"error":{"message":"API_KEY nao definida no servidor. Defina a variavel de ambiente API_KEY antes de iniciar o serve.ps1."}}'
+                $data = [System.Text.Encoding]::UTF8.GetBytes($msg)
+                $resp.StatusCode      = 500
+                $resp.ContentType     = 'application/json'
+                $resp.ContentLength64 = $data.Length
+                $resp.OutputStream.Write($data, 0, $data.Length)
+                $resp.OutputStream.Close()
+                Write-Host "  500  /api/groq  (API_KEY ausente)" -ForegroundColor Red
+                continue
+            }
+
+            try {
+                $groq = Invoke-WebRequest -Uri $groqEndpoint `
+                    -Method Post `
+                    -Headers @{ 'Authorization' = "Bearer $key" } `
+                    -ContentType 'application/json' `
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+                    -UserAgent 'ClassificadorAnimais/1.0' `
+                    -UseBasicParsing
+                $data = [System.Text.Encoding]::UTF8.GetBytes($groq.Content)
+                $resp.StatusCode      = [int]$groq.StatusCode
+                $resp.ContentType     = 'application/json'
+                $resp.ContentLength64 = $data.Length
+                $resp.OutputStream.Write($data, 0, $data.Length)
+                Write-Host "  $([int]$groq.StatusCode)  /api/groq -> Groq" -ForegroundColor Green
+            } catch {
+                $status  = 502
+                $errBody = $null
+                if ($_.Exception.Response) {
+                    try {
+                        $status = [int]$_.Exception.Response.StatusCode
+                        $sr     = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                        $errBody = $sr.ReadToEnd(); $sr.Close()
+                    } catch { }
+                }
+                if (-not $errBody) {
+                    $em = ($_.Exception.Message -replace '"', "'")
+                    $errBody = "{""error"":{""message"":""Falha ao contatar a Groq: $em""}}"
+                }
+                $data = [System.Text.Encoding]::UTF8.GetBytes($errBody)
+                $resp.StatusCode      = $status
+                $resp.ContentType     = 'application/json'
+                $resp.ContentLength64 = $data.Length
+                $resp.OutputStream.Write($data, 0, $data.Length)
+                Write-Host "  $status  /api/groq  (erro Groq)" -ForegroundColor Red
+            }
+            $resp.OutputStream.Close()
+            continue
+        }
 
         $filePath = Join-Path $root ($urlPath.TrimStart('/').Replace('/', '\'))
 

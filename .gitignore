@@ -1,0 +1,6 @@
+# Segredos — nunca commitar a chave da API
+.env
+
+# Python
+__pycache__/
+*.pyc

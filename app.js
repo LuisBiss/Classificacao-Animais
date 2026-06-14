@@ -10,6 +10,10 @@ const MODEL_URL = './model.json';
 const METADATA_URL = './metadata.json';
 const IMAGE_SIZE = 224;
 
+// Complemento com IA generativa — proxy local injeta a API_KEY (ver serve.ps1)
+const GROQ_PROXY_URL = '/api/groq';
+const GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
 const CLASS_EMOJIS = {
   'Cachorro': '\uD83D\uDC36',
   'Cavalo': '\uD83D\uDC34',
@@ -27,6 +31,10 @@ let model = null;
 let webcamStream = null;
 let liveInterval = null;
 let currentTab = 'upload';
+
+// Complemento Groq: ultima predicao e imagem (still) classificada
+let lastTopPrediction = null;
+let lastImageForGroq = null; // data URL da ultima imagem fixa classificada
 
 // Evaluation state
 let evalImageStore = {};   // { className: [{ file, imgEl }] }
@@ -125,6 +133,7 @@ async function classifyUpload() {
   const btn = document.getElementById('btn-classify-upload');
   btn.disabled = true;
   btn.innerHTML = '<span class="btn-icon">⏳</span> Classificando...';
+  lastImageForGroq = img.src;
   try {
     showResults(await model.predict(img));
   } catch (err) {
@@ -203,10 +212,11 @@ async function captureAndClassify() {
 }
 
 // ── Exibicao de resultados ────────────────────────────────────
-function showResults(predictions) {
+function showResults(predictions, isLive = false) {
   if (!predictions || !predictions.length) return;
   const sorted = [...predictions].sort((a, b) => b.probability - a.probability);
   const best = sorted[0];
+  lastTopPrediction = best;
   document.getElementById('results-section').classList.remove('hidden');
   document.getElementById('top-emoji').textContent = CLASS_EMOJIS[best.className] || '\uD83D\uDC3E';
   document.getElementById('top-label').textContent = best.className;
@@ -231,6 +241,20 @@ function showResults(predictions) {
       setTimeout(() => { fill.style.width = `${fill.dataset.pct}%`; }, 50);
     });
   });
+
+  // Complemento Groq: disponivel apenas em imagens fixas (nao no fluxo ao vivo)
+  const groqSection = document.getElementById('groq-section');
+  const groqResult = document.getElementById('groq-result');
+  if (isLive || !lastImageForGroq) {
+    groqSection.classList.add('hidden');
+  } else {
+    groqSection.classList.remove('hidden');
+    groqResult.classList.add('hidden');
+    groqResult.innerHTML = '';
+    const gbtn = document.getElementById('btn-groq');
+    gbtn.disabled = false;
+    gbtn.innerHTML = '<span class="btn-icon">🤖</span> Complementar com IA (Groq)';
+  }
 }
 function clearResults() {
   document.getElementById('results-section').classList.add('hidden');
@@ -238,6 +262,14 @@ function clearResults() {
   document.getElementById('top-label').textContent = '—';
   document.getElementById('top-confidence').textContent = '—';
   document.getElementById('top-emoji').textContent = '\uD83D\uDC3E';
+
+  // Reseta o complemento Groq
+  const groqSection = document.getElementById('groq-section');
+  if (groqSection) groqSection.classList.add('hidden');
+  const groqResult = document.getElementById('groq-result');
+  if (groqResult) { groqResult.classList.add('hidden'); groqResult.innerHTML = ''; }
+  lastTopPrediction = null;
+  lastImageForGroq = null;
 }
 
 // ── Loading / Erros ───────────────────────────────────────────
@@ -264,6 +296,137 @@ function showError(msg) {
   toast.textContent = '\u26A0\uFE0F ' + msg;
   document.body.appendChild(toast);
   setTimeout(() => toast.remove(), 5500);
+}
+
+// =============================================================
+//   COMPLEMENTO COM IA GENERATIVA (Groq \u00B7 Llama 4 Scout)
+// =============================================================
+// Envia a imagem ja reconhecida pelo modelo local + a predicao para a Groq,
+// que confirma/corrige a identificacao e gera uma descricao rica. A chamada
+// passa pelo proxy local /api/groq, que injeta a API_KEY (ver serve.ps1).
+
+async function complementWithGroq() {
+  if (!lastImageForGroq || !lastTopPrediction) {
+    showError('Classifique uma imagem primeiro.');
+    return;
+  }
+  const btn = document.getElementById('btn-groq');
+  const out = document.getElementById('groq-result');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="btn-icon">\u23F3</span> Analisando com IA...';
+  out.classList.remove('hidden');
+  out.innerHTML = '<div class="groq-loading"><span class="groq-spinner"></span> A IA est\u00E1 analisando a imagem\u2026</div>';
+
+  try {
+    const dataURL = await prepareImageForGroq(lastImageForGroq, 768);
+    const top = lastTopPrediction;
+    const pct = (top.probability * 100).toFixed(1);
+
+    const payload = {
+      model: GROQ_MODEL,
+      temperature: 0.4,
+      max_tokens: 700,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: 'Voc\u00EA \u00E9 um zo\u00F3logo especialista em identifica\u00E7\u00E3o de animais. Responda SEMPRE em portugu\u00EAs do Brasil e SOMENTE com um objeto JSON v\u00E1lido, sem texto adicional.',
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text:
+                `Um modelo local classificou esta imagem como "${top.className}" com ${pct}% de confian\u00E7a. ` +
+                `Analise a imagem e responda em JSON com as chaves exatas: ` +
+                `"confirma" (booleano \u2014 true se o animal principal realmente \u00E9 ${top.className}, sen\u00E3o false), ` +
+                `"animal" (string \u2014 o animal que voc\u00EA de fato v\u00EA), ` +
+                `"especie_raca" (string \u2014 esp\u00E9cie ou ra\u00E7a prov\u00E1vel), ` +
+                `"descricao" (string \u2014 2 a 3 frases com caracter\u00EDsticas marcantes e uma curiosidade). ` +
+                `Responda apenas com o JSON.`,
+            },
+            { type: 'image_url', image_url: { url: dataURL } },
+          ],
+        },
+      ],
+    };
+
+    const resp = await fetch(GROQ_PROXY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const json = await resp.json();
+    if (!resp.ok) {
+      throw new Error(json?.error?.message || `Erro ${resp.status} ao consultar a Groq.`);
+    }
+    const content = json?.choices?.[0]?.message?.content || '';
+    renderGroqResult(content, top);
+  } catch (err) {
+    console.error('[Groq]', err);
+    out.innerHTML = `<div class="groq-error">\u26A0\uFE0F ${escapeHtml(err.message || 'Falha ao consultar a IA Groq.')}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<span class="btn-icon">\uD83D\uDD04</span> Analisar novamente';
+  }
+}
+
+// Redimensiona/recodifica a imagem para JPEG (mantem o envio < 4MB exigido pela Groq)
+function prepareImageForGroq(dataURL, maxDim = 768) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      let w = img.naturalWidth, h = img.naturalHeight;
+      const scale = Math.min(1, maxDim / Math.max(w, h));
+      w = Math.round(w * scale);
+      h = Math.round(h * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => reject(new Error('N\u00E3o foi poss\u00EDvel processar a imagem.'));
+    img.src = dataURL;
+  });
+}
+
+function renderGroqResult(content, top) {
+  const out = document.getElementById('groq-result');
+  let data;
+  try {
+    data = JSON.parse(content);
+  } catch (e) {
+    // Fallback: modelo nao retornou JSON valido \u2014 mostra o texto cru
+    out.innerHTML = `<div class="groq-card"><div class="groq-card-head"><span class="groq-logo">\uD83E\uDD16 Groq \u00B7 Llama 4 Scout</span></div><p class="groq-desc">${escapeHtml(content)}</p></div>`;
+    return;
+  }
+
+  const confirma = data.confirma === true || /^(sim|true|verdadeiro)$/i.test(String(data.confirma).trim());
+  const animal = data.animal || '\u2014';
+  const raca = data.especie_raca || data.especie || data.raca || '';
+  const desc = data.descricao || '';
+
+  const verdict = confirma
+    ? `<span class="groq-badge ok">\u2713 Groq concorda: ${escapeHtml(top.className)}</span>`
+    : `<span class="groq-badge diff">\u2717 Groq diverge \u2014 v\u00EA: ${escapeHtml(animal)}</span>`;
+
+  out.innerHTML = `
+    <div class="groq-card">
+      <div class="groq-card-head">
+        <span class="groq-logo">\uD83E\uDD16 Groq \u00B7 Llama 4 Scout</span>
+        ${verdict}
+      </div>
+      ${raca ? `<div class="groq-row"><strong>Esp\u00E9cie/Ra\u00E7a:</strong> ${escapeHtml(raca)}</div>` : ''}
+      ${desc ? `<p class="groq-desc">${escapeHtml(desc)}</p>` : ''}
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
 }
 
 // =============================================================
