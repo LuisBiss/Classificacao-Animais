@@ -14,6 +14,11 @@ const IMAGE_SIZE = 224;
 const GROQ_PROXY_URL = '/api/groq';
 const GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
+// Disparos automaticos da IA nas abas Webcam e Deteccao (ver "Histórico IA")
+const WEBCAM_GROQ_MIN_CONF = 0.60; // so dispara acima desta confianca ao vivo
+const WEBCAM_STABLE_POLLS = 2;     // classe precisa persistir N leituras (anti-flicker)
+const DET_WINDOW_MS = 1000;        // janela de 1s para escolher o melhor recorte
+
 const CLASS_EMOJIS = {
   'Cachorro': '\uD83D\uDC36',
   'Cavalo': '\uD83D\uDC34',
@@ -35,6 +40,19 @@ let currentTab = 'upload';
 // Complemento Groq: ultima predicao e imagem (still) classificada
 let lastTopPrediction = null;
 let lastImageForGroq = null; // data URL da ultima imagem fixa classificada
+
+// Histórico IA (aba "feed") — disparos automaticos de Webcam e Deteccao
+let feedCount = 0;
+// Webcam: so dispara quando o animal de topo muda para um diferente
+let lastWebcamGroqAnimal = null;
+let webcamGroqBusy = false;
+let webcamPendingClass = null; // classe candidata aguardando estabilizar
+let webcamPendingCount = 0;    // leituras consecutivas da classe candidata
+// Deteccao: janela de 1s guarda o melhor recorte de categoria unica
+let detWindowStart = 0;
+let detWindowBest = null;  // { score, class, crop }
+let detGroqBusy = false;
+let lastDetGroqClass = null; // ultima categoria enviada (dedup por mudanca)
 
 // Evaluation state
 let evalImageStore = {};   // { className: [{ file, imgEl }] }
@@ -81,6 +99,11 @@ function switchTab(tab) {
   if (tab !== 'eval') clearResults();
   // Stop detection webcam if leaving the detect tab
   if (tab !== 'detect') stopDetWebcam();
+  // Ao abrir o Histórico IA, para de pulsar o aviso de novas análises
+  if (tab === 'feed') {
+    const badge = document.getElementById('feed-tab-badge');
+    if (badge) badge.classList.remove('pulse');
+  }
 }
 
 // ── Upload de imagem ─────────────────────────────────────────
@@ -159,6 +182,9 @@ async function startWebcam() {
     document.getElementById('btn-start-webcam').classList.add('hidden');
     document.getElementById('btn-stop-webcam').classList.remove('hidden');
     document.getElementById('btn-capture').classList.remove('hidden');
+    lastWebcamGroqAnimal = null;
+    webcamPendingClass = null;
+    webcamPendingCount = 0;
     startLiveClassification();
   } catch (err) {
     if (err.name === 'NotAllowedError') showError('Permissao de camera negada.');
@@ -167,6 +193,9 @@ async function startWebcam() {
 }
 function stopWebcam() {
   stopLiveClassification();
+  lastWebcamGroqAnimal = null;
+  webcamPendingClass = null;
+  webcamPendingCount = 0;
   if (webcamStream) { webcamStream.getTracks().forEach(t => t.stop()); webcamStream = null; }
   const video = document.getElementById('webcam-video');
   video.srcObject = null;
@@ -190,7 +219,48 @@ function stopLiveClassification() {
 }
 async function classifyVideoFrame(videoEl) {
   if (!model || !videoEl) return;
-  try { showResults(await model.predict(videoEl), true); } catch (e) { }
+  let preds;
+  try { preds = await model.predict(videoEl); } catch (e) { return; }
+  showResults(preds, true);
+  maybeWebcamGroq(preds);
+}
+
+// Dispara a Groq quando o animal de topo muda para um diferente. Para evitar
+// rajadas pela oscilacao (flicker) do classificador ao vivo, a nova classe
+// precisa persistir por WEBCAM_STABLE_POLLS leituras antes de contar como
+// mudanca real. Acrescenta ao Histórico.
+function maybeWebcamGroq(predictions) {
+  if (!predictions || !predictions.length) return;
+  const top = predictions.reduce((a, b) => a.probability > b.probability ? a : b);
+  if (top.probability < WEBCAM_GROQ_MIN_CONF) {
+    webcamPendingClass = null;
+    webcamPendingCount = 0;
+    return;
+  }
+
+  // Conta leituras consecutivas da mesma classe (estabilidade)
+  if (top.className === webcamPendingClass) webcamPendingCount++;
+  else { webcamPendingClass = top.className; webcamPendingCount = 1; }
+
+  if (top.className === lastWebcamGroqAnimal) return;     // ja enviado p/ este animal
+  if (webcamPendingCount < WEBCAM_STABLE_POLLS) return;   // ainda nao estabilizou
+  if (webcamGroqBusy) return;                             // espera a chamada anterior
+
+  lastWebcamGroqAnimal = top.className;
+  webcamGroqBusy = true;
+  const thumb = captureWebcamThumb();
+  sendToFeed({ source: 'webcam', thumb, localLabel: top.className, confidence: top.probability })
+    .finally(() => { webcamGroqBusy = false; });
+}
+
+// Captura o frame atual da webcam como JPEG (data URL) para enviar a Groq.
+function captureWebcamThumb() {
+  const video = document.getElementById('webcam-video');
+  const c = document.createElement('canvas');
+  c.width = video.videoWidth || IMAGE_SIZE;
+  c.height = video.videoHeight || IMAGE_SIZE;
+  c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85);
 }
 async function captureAndClassify() {
   const video = document.getElementById('webcam-video');
@@ -305,6 +375,99 @@ function showError(msg) {
 // que confirma/corrige a identificacao e gera uma descricao rica. A chamada
 // passa pelo proxy local /api/groq, que injeta a API_KEY (ver serve.ps1).
 
+// Monta o corpo OpenAI-compatible enviado ao proxy /api/groq. O texto e
+// parametrizado pelo rotulo local (modelo TM ou COCO-SSD) e sua confianca.
+function buildGroqPayload(localLabel, pct, dataURL) {
+  return {
+    model: GROQ_MODEL,
+    temperature: 0.4,
+    max_tokens: 700,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: 'Voc\u00EA \u00E9 um zo\u00F3logo especialista em identifica\u00E7\u00E3o de animais. Responda SEMPRE em portugu\u00EAs do Brasil e SOMENTE com um objeto JSON v\u00E1lido, sem texto adicional.',
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text:
+              `Um modelo local classificou esta imagem como "${localLabel}" com ${pct}% de confian\u00E7a. ` +
+              `Analise a imagem e responda em JSON com as chaves exatas: ` +
+              `"confirma" (booleano \u2014 true se o animal principal realmente \u00E9 ${localLabel}, sen\u00E3o false), ` +
+              `"animal" (string \u2014 o animal que voc\u00EA de fato v\u00EA), ` +
+              `"especie_raca" (string \u2014 esp\u00E9cie ou ra\u00E7a prov\u00E1vel), ` +
+              `"descricao" (string \u2014 2 a 3 frases com caracter\u00EDsticas marcantes e uma curiosidade). ` +
+              `Responda apenas com o JSON.`,
+          },
+          { type: 'image_url', image_url: { url: dataURL } },
+        ],
+      },
+    ],
+  };
+}
+
+// Faz o POST ao proxy local e devolve o texto da resposta (ou lanca erro).
+async function postGroq(payload) {
+  const resp = await fetch(GROQ_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const json = await resp.json();
+  if (!resp.ok) {
+    throw new Error(json?.error?.message || `Erro ${resp.status} ao consultar a Groq.`);
+  }
+  return json?.choices?.[0]?.message?.content || '';
+}
+
+// Faz a chamada completa: prepara a imagem, monta payload e devolve o texto.
+async function callGroq(imageDataURL, localLabel, confidence) {
+  const dataURL = await prepareImageForGroq(imageDataURL, 768);
+  const pct = (confidence * 100).toFixed(1);
+  return postGroq(buildGroqPayload(localLabel, pct, dataURL));
+}
+
+// Interpreta a resposta JSON da Groq (com fallback para texto cru).
+function parseGroqData(content) {
+  try {
+    const d = JSON.parse(content);
+    return {
+      ok: true,
+      confirma: d.confirma === true || /^(sim|true|verdadeiro)$/i.test(String(d.confirma).trim()),
+      animal: d.animal || '\u2014',
+      raca: d.especie_raca || d.especie || d.raca || '',
+      desc: d.descricao || '',
+    };
+  } catch (e) {
+    return { ok: false, raw: content };
+  }
+}
+
+// Gera o conteudo interno de um card da Groq (compartilhado: Upload + Hist\u00F3rico).
+function groqVerdictHtml(parsed, localLabel) {
+  let badge = '';
+  let rows = '';
+  if (parsed.ok) {
+    badge = parsed.confirma
+      ? `<span class="groq-badge ok">\u2713 Groq concorda: ${escapeHtml(localLabel)}</span>`
+      : `<span class="groq-badge diff">\u2717 Groq diverge \u2014 v\u00EA: ${escapeHtml(parsed.animal)}</span>`;
+    rows =
+      (parsed.raca ? `<div class="groq-row"><strong>Esp\u00E9cie/Ra\u00E7a:</strong> ${escapeHtml(parsed.raca)}</div>` : '') +
+      (parsed.desc ? `<p class="groq-desc">${escapeHtml(parsed.desc)}</p>` : '');
+  } else {
+    rows = `<p class="groq-desc">${escapeHtml(parsed.raw)}</p>`;
+  }
+  return `
+    <div class="groq-card-head">
+      <span class="groq-logo">\uD83E\uDD16 Groq \u00B7 Llama 4 Scout</span>
+      ${badge}
+    </div>
+    ${rows}`;
+}
+
 async function complementWithGroq() {
   if (!lastImageForGroq || !lastTopPrediction) {
     showError('Classifique uma imagem primeiro.');
@@ -318,50 +481,8 @@ async function complementWithGroq() {
   out.innerHTML = '<div class="groq-loading"><span class="groq-spinner"></span> A IA est\u00E1 analisando a imagem\u2026</div>';
 
   try {
-    const dataURL = await prepareImageForGroq(lastImageForGroq, 768);
     const top = lastTopPrediction;
-    const pct = (top.probability * 100).toFixed(1);
-
-    const payload = {
-      model: GROQ_MODEL,
-      temperature: 0.4,
-      max_tokens: 700,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: 'Voc\u00EA \u00E9 um zo\u00F3logo especialista em identifica\u00E7\u00E3o de animais. Responda SEMPRE em portugu\u00EAs do Brasil e SOMENTE com um objeto JSON v\u00E1lido, sem texto adicional.',
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text:
-                `Um modelo local classificou esta imagem como "${top.className}" com ${pct}% de confian\u00E7a. ` +
-                `Analise a imagem e responda em JSON com as chaves exatas: ` +
-                `"confirma" (booleano \u2014 true se o animal principal realmente \u00E9 ${top.className}, sen\u00E3o false), ` +
-                `"animal" (string \u2014 o animal que voc\u00EA de fato v\u00EA), ` +
-                `"especie_raca" (string \u2014 esp\u00E9cie ou ra\u00E7a prov\u00E1vel), ` +
-                `"descricao" (string \u2014 2 a 3 frases com caracter\u00EDsticas marcantes e uma curiosidade). ` +
-                `Responda apenas com o JSON.`,
-            },
-            { type: 'image_url', image_url: { url: dataURL } },
-          ],
-        },
-      ],
-    };
-
-    const resp = await fetch(GROQ_PROXY_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const json = await resp.json();
-    if (!resp.ok) {
-      throw new Error(json?.error?.message || `Erro ${resp.status} ao consultar a Groq.`);
-    }
-    const content = json?.choices?.[0]?.message?.content || '';
+    const content = await callGroq(lastImageForGroq, top.className, top.probability);
     renderGroqResult(content, top);
   } catch (err) {
     console.error('[Groq]', err);
@@ -394,33 +515,85 @@ function prepareImageForGroq(dataURL, maxDim = 768) {
 
 function renderGroqResult(content, top) {
   const out = document.getElementById('groq-result');
-  let data;
-  try {
-    data = JSON.parse(content);
-  } catch (e) {
-    // Fallback: modelo nao retornou JSON valido \u2014 mostra o texto cru
-    out.innerHTML = `<div class="groq-card"><div class="groq-card-head"><span class="groq-logo">\uD83E\uDD16 Groq \u00B7 Llama 4 Scout</span></div><p class="groq-desc">${escapeHtml(content)}</p></div>`;
-    return;
-  }
+  out.innerHTML = `<div class="groq-card">${groqVerdictHtml(parseGroqData(content), top.className)}</div>`;
+}
 
-  const confirma = data.confirma === true || /^(sim|true|verdadeiro)$/i.test(String(data.confirma).trim());
-  const animal = data.animal || '\u2014';
-  const raca = data.especie_raca || data.especie || data.raca || '';
-  const desc = data.descricao || '';
+// =============================================================
+//   HIST\u00D3RICO IA (aba "feed") \u2014 append das respostas da Groq
+// =============================================================
+// As abas Webcam e Deteccao podem disparar varias chamadas; cada resposta
+// e acrescentada como um card aqui, sem substituir as anteriores.
 
-  const verdict = confirma
-    ? `<span class="groq-badge ok">\u2713 Groq concorda: ${escapeHtml(top.className)}</span>`
-    : `<span class="groq-badge diff">\u2717 Groq diverge \u2014 v\u00EA: ${escapeHtml(animal)}</span>`;
+// Cria um card em estado "carregando" no topo da lista e devolve o slot
+// onde a resposta (ou erro) sera escrita.
+function pushFeedEntry({ source, thumb, localLabel, confidence }) {
+  const list = document.getElementById('feed-list');
+  document.getElementById('feed-empty').classList.add('hidden');
 
-  out.innerHTML = `
-    <div class="groq-card">
-      <div class="groq-card-head">
-        <span class="groq-logo">\uD83E\uDD16 Groq \u00B7 Llama 4 Scout</span>
-        ${verdict}
+  const meta = source === 'webcam'
+    ? { cls: 'webcam', icon: '\uD83D\uDCF7', text: 'Webcam' }
+    : { cls: 'detect', icon: '\uD83D\uDD0D', text: 'Detec\u00E7\u00E3o' };
+  const time = new Date().toLocaleTimeString('pt-BR');
+  const pct = (confidence * 100).toFixed(1);
+
+  const card = document.createElement('div');
+  card.className = 'feed-card';
+  card.innerHTML = `
+    <div class="feed-thumb"><img src="${thumb}" alt="${escapeHtml(localLabel)}" /></div>
+    <div class="feed-body">
+      <div class="feed-head">
+        <span class="feed-source feed-source-${meta.cls}">${meta.icon} ${meta.text}</span>
+        <span class="feed-time">${time}</span>
       </div>
-      ${raca ? `<div class="groq-row"><strong>Esp\u00E9cie/Ra\u00E7a:</strong> ${escapeHtml(raca)}</div>` : ''}
-      ${desc ? `<p class="groq-desc">${escapeHtml(desc)}</p>` : ''}
+      <div class="feed-local">Modelo local: <strong>${escapeHtml(localLabel)}</strong> \u00B7 ${pct}%</div>
+      <div class="feed-groq groq-card">
+        <div class="groq-loading"><span class="groq-spinner"></span> A IA est\u00E1 analisando\u2026</div>
+      </div>
     </div>`;
+  list.prepend(card);
+
+  feedCount++;
+  updateFeedBadge();
+  return card.querySelector('.feed-groq');
+}
+
+function updateFeedBadge() {
+  const total = document.getElementById('feed-total');
+  if (total) total.textContent = feedCount;
+  const badge = document.getElementById('feed-tab-badge');
+  if (badge) {
+    badge.textContent = feedCount;
+    badge.classList.toggle('hidden', feedCount === 0);
+    if (feedCount > 0 && currentTab !== 'feed') badge.classList.add('pulse');
+  }
+}
+
+function clearFeed() {
+  document.getElementById('feed-list').innerHTML = '';
+  document.getElementById('feed-empty').classList.remove('hidden');
+  feedCount = 0;
+  updateFeedBadge();
+  // Permite re-disparar a categoria atual depois de limpar o historico
+  lastWebcamGroqAnimal = null;
+  lastDetGroqClass = null;
+}
+
+// Ponto de entrada usado por Webcam e Deteccao: cria o card e o preenche
+// quando a Groq responde. Erros viram um card de erro (nao quebram o loop).
+async function sendToFeed(opts) {
+  const slot = pushFeedEntry(opts);
+  try {
+    const content = await callGroq(opts.thumb, opts.localLabel, opts.confidence);
+    slot.innerHTML = groqVerdictHtml(parseGroqData(content), opts.localLabel);
+  } catch (err) {
+    console.error('[Groq feed]', err);
+    // Limite de uso (TPM/RPM) recebe um card informativo, nao de erro
+    if (/rate limit|429/i.test(err.message || '')) {
+      slot.innerHTML = '<div class="groq-warn">\u23F3 Limite de uso da IA atingido momentaneamente \u2014 tente novamente em alguns segundos.</div>';
+    } else {
+      slot.innerHTML = `<div class="groq-error">\u26A0\uFE0F ${escapeHtml(err.message || 'Falha ao consultar a IA Groq.')}</div>`;
+    }
+  }
 }
 
 function escapeHtml(s) {
@@ -993,6 +1166,9 @@ async function startDetWebcam() {
     document.getElementById('btn-det-webcam-start').classList.add('hidden');
     document.getElementById('btn-det-webcam-stop').classList.remove('hidden');
     document.getElementById('det-live-indicator').classList.remove('hidden');
+    detWindowStart = 0;
+    detWindowBest = null;
+    lastDetGroqClass = null;
     video.addEventListener('loadeddata', startDetLoop);
   } catch (err) {
     if (err.name === 'NotAllowedError') showError('Permissao de camera negada.');
@@ -1002,6 +1178,9 @@ async function startDetWebcam() {
 
 function stopDetWebcam() {
   stopDetLoop();
+  detWindowStart = 0;
+  detWindowBest = null;
+  lastDetGroqClass = null;
   if (detStream) { detStream.getTracks().forEach(t => t.stop()); detStream = null; }
   const video = document.getElementById('det-video');
   if (video) { video.srcObject = null; }
@@ -1052,10 +1231,61 @@ async function detectionLoop(timestamp) {
         const predictions = await cocoModel.detect(video);
         drawBoundingBoxes(canvas, predictions, offsetX, offsetY, scale);
         renderDetResults(predictions);
+        accumulateDetGroq(predictions, video, timestamp);
       } catch (e) { /* ignore frame errors */ }
     }
   }
   detLoopId = requestAnimationFrame(detectionLoop);
+}
+
+// ── Disparo automatico da Groq na Deteccao ────────────────────
+// A cada janela de 1s, escolhe o objeto de "categoria unica" (que aparece
+// uma unica vez no frame) com a MAIOR confianca, recorta seu bounding box e
+// envia ao Histórico IA. Aplica-se apenas ao modo webcam ao vivo.
+function accumulateDetGroq(predictions, video, timestamp) {
+  if (!detWindowStart) detWindowStart = timestamp;
+
+  // "primeiro objeto de categoria unica": classe que ocorre 1x no frame
+  const counts = {};
+  predictions.forEach(p => { counts[p.class] = (counts[p.class] || 0) + 1; });
+  const cand = predictions.find(p => counts[p.class] === 1 && p.score >= 0.30);
+
+  // Guarda o melhor candidato da janela (recorta no pico, pois o frame muda)
+  if (cand && (!detWindowBest || cand.score > detWindowBest.score)) {
+    detWindowBest = { score: cand.score, class: cand.class, crop: cropFromVideo(video, cand.bbox) };
+  }
+
+  // Fecha a janela: envia o melhor recorte SE a categoria mudou. Sem a
+  // comparacao com lastDetGroqClass, uma cena estavel dispararia ~1 req/s.
+  if (timestamp - detWindowStart >= DET_WINDOW_MS) {
+    if (detWindowBest && !detGroqBusy && detWindowBest.class !== lastDetGroqClass) {
+      detGroqBusy = true;
+      lastDetGroqClass = detWindowBest.class; // marca como enviada (nao reverte em erro)
+      const best = detWindowBest;
+      sendToFeed({
+        source: 'detect',
+        thumb: best.crop,
+        localLabel: COCO_PT[best.class] || best.class,
+        confidence: best.score,
+      }).finally(() => { detGroqBusy = false; });
+    }
+    detWindowStart = timestamp;
+    detWindowBest = null;
+  }
+}
+
+// Recorta o bounding box (coordenadas naturais do video) como JPEG data URL.
+function cropFromVideo(video, bbox) {
+  let [x, y, w, h] = bbox;
+  x = Math.max(0, x);
+  y = Math.max(0, y);
+  w = Math.min(video.videoWidth - x, w);
+  h = Math.min(video.videoHeight - y, h);
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  c.getContext('2d').drawImage(video, x, y, w, h, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85);
 }
 
 // (getContainRect and getCoverRect removed — layout computed inline for precision)

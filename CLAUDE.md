@@ -9,7 +9,7 @@ Animal image classifier and object detector. Vanilla HTML/CSS/JS — there is no
 Two local ML models run in the browser, plus an optional cloud LLM:
 - **Teachable Machine model** (local `model.json` + `weights.bin`): classifies 9 animal classes. Powers the Upload, Webcam, and Avaliação (evaluation) tabs.
 - **COCO-SSD / SSD MobileNet** (loaded lazily from CDN): object detection with bounding boxes. Powers the Detecção tab. Covers only 6 of the 9 classes (dog, horse, elephant, cat, cow, sheep).
-- **Groq generative AI** (`meta-llama/llama-4-scout-17b-16e-instruct`, cloud, optional): on the Upload-tab result, complements the local prediction by verifying it and writing a rich description. Requires running through `serve.ps1` (which proxies the call and injects the API key) — see "Groq integration" below. This is the only feature that is *not* purely client-side.
+- **Groq generative AI** (`meta-llama/llama-4-scout-17b-16e-instruct`, cloud, optional): complements the local prediction by verifying it and writing a rich description. Triggered three ways — manually on the Upload tab (button), and automatically from the Webcam and Detecção tabs (results appended to a dedicated **Histórico IA** tab). Requires running through `serve.ps1`/`serve.py` (which proxies the call and injects the API key) — see "Groq integration" below. This is the only feature that is *not* purely client-side.
 
 ## Running
 
@@ -35,7 +35,7 @@ Gotchas learned the hard way:
 
 Everything lives in 3 source files plus 3 model assets:
 
-- `index.html` — single page, four tab panels (`panel-upload`, `panel-webcam`, `panel-eval`, `panel-detect`). DOM is wired with inline `onclick=` handlers calling global functions in `app.js`. CDN `<script>` tags at the bottom load tfjs 1.3.1, @teachablemachine/image 0.8, and @tensorflow-models/coco-ssd 2.2.2 (pinned versions) before `app.js`.
+- `index.html` — single page, five tab panels (`panel-upload`, `panel-webcam`, `panel-eval`, `panel-detect`, `panel-feed`). DOM is wired with inline `onclick=` handlers calling global functions in `app.js`. CDN `<script>` tags at the bottom load tfjs 1.3.1, @teachablemachine/image 0.8, and @tensorflow-models/coco-ssd 2.2.2 (pinned versions) before `app.js`.
 - `app.js` — all logic, organized into commented sections: classification/webcam, the Groq generative complement, model evaluation, and COCO-SSD detection. Functions are global (called from inline HTML handlers). Module state is module-scoped `let` vars (`model`, `cocoModel`, `webcamStream`, `detStream`, `evalImageStore`, `lastTopPrediction`, `lastImageForGroq`, etc.).
 - `style.css` — dark-mode glassmorphism UI.
 - `model.json`, `weights.bin`, `metadata.json` — exported Teachable Machine model (see "Model assets" below). `metadata.json` `labels` array and the `CLASSES`/`CLASS_EMOJIS` constants in `app.js` must stay in sync.
@@ -59,10 +59,31 @@ These are generated artifacts (exported from Teachable Machine), not hand-edited
 
 ### Groq integration
 
-The "Complementar com IA (Groq)" button (in the shared `results-section`) sends the last **still** image plus the local top prediction to Groq for verification + a Portuguese description. Flow:
+The "Complementar com IA (Groq)" button (`#btn-groq` in the shared `results-section`, `index.html:319`) sends the last **still** image plus the local top prediction to Groq for verification + a Portuguese description. The request makes **two hops**: browser → local proxy (`/api/groq`) → Groq. The browser never sees the API key — the proxy injects it server-side.
 
-- `app.js` builds an OpenAI-compatible chat-completions body (model `GROQ_MODEL`, `response_format: json_object`, system + multimodal user message with a base64 `image_url`) and `fetch`es the local proxy `GROQ_PROXY_URL` (`/api/groq`). It never sees the API key.
-- `serve.ps1` adds `Authorization: Bearer $env:API_KEY` and forwards to `https://api.groq.com/openai/v1/chat/completions`, returning the response (or a JSON error if `API_KEY` is unset / Groq fails).
-- The image is downscaled to ≤768px JPEG (`prepareImageForGroq`) before sending — Groq caps base64 images at 4 MB.
-- Scoped to the **Upload tab**: `lastImageForGroq` is set only in `classifyUpload`. It is intentionally *not* set on the webcam path — `captureAndClassify` resumes live classification in its `finally`, so a live frame would re-hide the section ~800ms later. `showResults(predictions, isLive)` hides the Groq section when `isLive` is true or when `lastImageForGroq` is null (so it never fires per-frame or on the webcam tab). `switchTab` → `clearResults` nulls the state when changing tabs.
-- Groq is expected to return JSON (`confirma`, `animal`, `especie_raca`, `descricao`); `renderGroqResult` parses it and falls back to raw text if parsing fails.
+**Where it's wired** (all in `app.js`):
+- Constants: `GROQ_PROXY_URL = '/api/groq'`, `GROQ_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct'` (`app.js:14-15`).
+- State (module-scoped): `lastImageForGroq` (data URL of the last still image) and `lastTopPrediction` (top class object). Both are required — `complementWithGroq` bails with "Classifique uma imagem primeiro." if either is null (`app.js:308-312`).
+- `lastImageForGroq` is set **only** in `classifyUpload` (`app.js:136`); `lastTopPrediction` is set in `showResults` for **every** prediction (`app.js:219`, including webcam frames). The Upload-only scoping is enforced by the image gate, not the prediction gate.
+
+**The request (how & in what form)** — `complementWithGroq` (`app.js:308-373`):
+1. Downscales the still to ≤768px and re-encodes as JPEG quality 0.85 via `prepareImageForGroq` (`app.js:376`) — Groq caps base64 images at 4 MB.
+2. Builds an OpenAI-compatible chat-completions body: `model: GROQ_MODEL`, `temperature: 0.4`, `max_tokens: 700`, `response_format: { type: 'json_object' }`, a `system` message (pt-BR zoologist, "respond ONLY with valid JSON"), and a multimodal `user` message — a `text` part (states the local class + confidence %, requests JSON with exact keys `confirma`/`animal`/`especie_raca`/`descricao`) plus an `image_url` part holding the base64 data URL.
+3. `POST`s it as JSON to `GROQ_PROXY_URL`. On `!resp.ok` it throws `json.error.message` (or `Erro <status>…`); on success it reads `choices[0].message.content` and calls `renderGroqResult`.
+4. `renderGroqResult` (`app.js:395`) `JSON.parse`s the content into a verdict card (✓ concorda / ✗ diverge), espécie/raça row, and descrição; on parse failure it falls back to rendering the raw text.
+
+**The proxy** (`serve.py` `do_POST` / `serve.ps1` `/api/groq` block — keep in sync):
+- Only `POST /api/groq` is dynamic; everything else is static file serving. Other methods/paths → 404.
+- Reads the request body verbatim, adds `Authorization: Bearer <API_KEY>` + `Content-Type: application/json` + `User-Agent: ClassificadorAnimais/1.0`, and forwards to `https://api.groq.com/openai/v1/chat/completions` (`GROQ_ENDPOINT`). The custom User-Agent is mandatory — Groq's Cloudflare returns 403 `error code: 1010` to default `urllib`/PowerShell agents.
+- `API_KEY` comes from the environment or the git-ignored `.env` (env var wins; `.env` is `setdefault`). If unset → HTTP 500 with `{"error":{"message":"API_KEY nao definida no servidor…"}}`, which surfaces in the Groq card as the error message.
+- Upstream `HTTPError` is relayed with Groq's own status + body; any other failure → HTTP 502 `{"error":{"message":"Falha ao contatar a Groq: …"}}`. Both responses are always JSON so the browser's `json.error.message` path works.
+- `serve.ps1` additionally forces TLS 1.2 (`ServicePointManager.SecurityProtocol`) — Windows PowerShell 5.1 doesn't default to it and Groq requires it.
+
+**Tab scoping & lifecycle (Upload button)**: `showResults(predictions, isLive)` hides the Groq section when `isLive` is true **or** when `lastImageForGroq` is null (so it never fires per-frame or on the webcam tab). It's intentionally *not* set on the webcam path: `captureAndClassify` resumes live classification in its `finally`, so a captured frame would re-hide the section ~800ms later. `switchTab` → `clearResults` nulls both `lastImageForGroq` and `lastTopPrediction` and hides the section.
+
+**Shared Groq helpers** (refactored so all three modules share one path): `buildGroqPayload(localLabel, pct, dataURL)` builds the body; `postGroq(payload)` does the `fetch` + error throw; `callGroq(imageDataURL, localLabel, confidence)` chains `prepareImageForGroq` → build → post; `parseGroqData(content)` returns `{ ok, confirma, animal, raca, desc }` (or `{ ok:false, raw }`); `groqVerdictHtml(parsed, localLabel)` renders the card inner HTML. The Upload button (`complementWithGroq`) and the feed both call these.
+
+**Automatic triggers → Histórico IA feed**: the Webcam and Detecção tabs can each fire **multiple** Groq calls, so their results are appended (newest first) to the `panel-feed` tab instead of the shared `results-section`. `sendToFeed({ source, thumb, localLabel, confidence })` (`app.js`) creates a loading card via `pushFeedEntry`, calls `callGroq`, then fills the card with `groqVerdictHtml` (or an error card). `updateFeedBadge` keeps the tab badge count + `pulse` (cleared when the feed tab is opened in `switchTab`); `clearFeed` empties it.
+- **Webcam** (`maybeWebcamGroq`, called from `classifyVideoFrame`): fires only when the top class **changes to a different animal**, above `WEBCAM_GROQ_MIN_CONF` (0.60), and not while a call is in flight (`webcamGroqBusy`). To avoid bursts from live-classifier flicker, the new class must persist for `WEBCAM_STABLE_POLLS` (2) consecutive reads before counting as a real change (`webcamPendingClass`/`webcamPendingCount`). `lastWebcamGroqAnimal` tracks the last sent class and is reset on webcam start/stop and `clearFeed`. The sent image is the full current frame (`captureWebcamThumb`).
+- **Detecção** (`accumulateDetGroq`, called from `detectionLoop`, webcam mode only): over a tumbling **1s window** (`DET_WINDOW_MS`), keeps the highest-scoring detection whose class is **unique in the frame** (count===1, score ≥ 0.30); on window close it sends **only if the category changed** vs. the last sent (`lastDetGroqClass`) — otherwise a stable scene would fire ~1 req/s and blow the 30k TPM limit. The crop is taken from the video at peak (`cropFromVideo`, natural coords). Guarded by `detGroqBusy`; window + dedup state reset on det-webcam start/stop and `clearFeed`. Image-mode detection does **not** trigger Groq.
+- **Rate-limit handling**: dedup-by-change is the only throttle (no global min-interval/backoff, by design). A 429 / "Rate limit" response is shown as a soft `groq-warn` card (not a red error), and dedup state is **not** reverted on failure so a failed attempt never spams the same category.

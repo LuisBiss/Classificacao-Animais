@@ -43,6 +43,10 @@
         <button id="tab-detect" class="tab" role="tab" aria-selected="false" aria-controls="panel-detect" onclick="switchTab('detect')">
           <span class="tab-icon">🔍</span> Detecção
         </button>
+        <button id="tab-feed" class="tab" role="tab" aria-selected="false" aria-controls="panel-feed" onclick="switchTab('feed')">
+          <span class="tab-icon">🤖</span> Histórico IA
+          <span id="feed-tab-badge" class="tab-badge hidden">0</span>
+        </button>
       </div>
 
       <!-- Upload Panel -->
@@ -298,6 +302,23 @@
           <p id="det-no-results" class="det-no-results hidden">Nenhum animal detectado com confiança suficiente.</p>
         </div>
 
+      </div>
+
+      <!-- Histórico IA Panel (append das respostas da Groq) -->
+      <div id="panel-feed" class="panel hidden" role="tabpanel" aria-labelledby="tab-feed">
+        <div class="feed-banner">
+          <div class="feed-banner-icon">🤖</div>
+          <div class="feed-banner-text">
+            <strong>Histórico de Análises com IA (Groq · Llama 4 Scout)</strong>
+            <p>A cada vez que a <strong>Webcam</strong> reconhece um animal diferente, ou que a <strong>Detecção</strong> ao vivo captura o objeto de maior confiança a cada segundo, a imagem é enviada à IA generativa e o resultado é acrescentado abaixo.</p>
+          </div>
+        </div>
+        <div class="feed-toolbar">
+          <span class="feed-toolbar-info"><span id="feed-total">0</span> análise(s)</span>
+          <button class="btn-clear" onclick="clearFeed()">Limpar histórico</button>
+        </div>
+        <div id="feed-list" class="feed-list"></div>
+        <p id="feed-empty" class="feed-empty">Nenhuma análise ainda. Abra a aba <strong>Webcam</strong> ou <strong>Detecção</strong> (modo ao vivo) para que a IA comece a complementar os reconhecimentos.</p>
       </div>
 
       <!-- Results Section -->
