@@ -627,24 +627,41 @@ function buildEvalGrid() {
     card.id = `eval-card-${cls}`;
     card.setAttribute('tabindex', '0');
     card.setAttribute('role', 'button');
-    card.setAttribute('aria-label', `Adicionar imagens de teste da classe ${cls}`);
+    card.setAttribute('aria-label', `Adicionar imagens de teste da classe ${cls} \u2014 clique ou arraste`);
     card.addEventListener('click', () => hiddenInput.click());
     card.addEventListener('keydown', e => { if (e.key === 'Enter') hiddenInput.click(); });
+    // Arrastar-e-soltar (igual a aba Upload): aceita imagens incl. WebP
+    card.addEventListener('dragover', e => { e.preventDefault(); card.classList.add('drag-over'); });
+    card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+    card.addEventListener('drop', e => {
+      e.preventDefault();
+      card.classList.remove('drag-over');
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        handleEvalFiles(cls, e.dataTransfer.files);
+      }
+    });
     card.innerHTML = `
       <span class="eval-class-emoji">${CLASS_EMOJIS[cls] || '\uD83D\uDC3E'}</span>
       <span class="eval-class-name">${cls}</span>
-      <span class="eval-class-count" id="eval-count-${cls}">Clique para adicionar</span>
+      <span class="eval-class-count" id="eval-count-${cls}">Clique ou arraste</span>
       <div class="eval-thumbnails" id="eval-thumbs-${cls}"></div>`;
     grid.appendChild(card);
   });
 }
 
+// Reconhece imagens por MIME (image/*) ou, como fallback, pela extensao —
+// alguns arquivos arrastados (ex.: WebP) chegam com file.type vazio.
+function isImageFile(file) {
+  if (file.type && file.type.startsWith('image/')) return true;
+  return /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(file.name || '');
+}
+
 // ── Handle uploaded eval files ────────────────────────────────
 function handleEvalFiles(cls, files) {
   if (!files || !files.length) return;
+  const images = Array.from(files).filter(isImageFile);
   let loaded = 0;
-  Array.from(files).forEach(file => {
-    if (!file.type.startsWith('image/')) return;
+  images.forEach(file => {
     const img = new Image();
     const reader = new FileReader();
     reader.onload = ev => {
@@ -654,7 +671,7 @@ function handleEvalFiles(cls, files) {
         loaded++;
         updateClassCard(cls);
         updateEvalSummary();
-        if (loaded === Array.from(files).filter(f => f.type.startsWith('image/')).length) {
+        if (loaded === images.length) {
           img.onload = null; // cleanup
         }
       };
@@ -681,7 +698,7 @@ function updateClassCard(cls) {
     card.appendChild(badge);
   }
 
-  count.textContent = items.length > 0 ? `${items.length} imagem(ns)` : 'Clique para adicionar';
+  count.textContent = items.length > 0 ? `${items.length} imagem(ns)` : 'Clique ou arraste';
   count.classList.toggle('loaded', items.length > 0);
 
   // Thumbnails (max 6)

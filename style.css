@@ -673,6 +673,14 @@ body {
   background: rgba(34,197,94,0.06);
 }
 
+.eval-class-card.drag-over {
+  border-color: var(--accent-1);
+  border-style: solid;
+  background: rgba(108,99,255,0.12);
+  box-shadow: 0 0 0 3px rgba(108,99,255,0.15);
+  transform: translateY(-2px);
+}
+
 .eval-class-emoji { font-size: 1.5rem; line-height: 1; }
 
 .eval-class-name {
